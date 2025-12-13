@@ -1,22 +1,18 @@
 #main.py
 import asyncio
-import os
-import re
-import time
-from datetime import datetime
-from typing import Dict, Optional, List, Tuple
 import logging
-
-from telethon import TelegramClient, events, types
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    FloodWaitError
-)
-from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
-import aiosqlite
-import aiofiles
-from config import Config
+from datetime import datetime
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import SessionPasswordNeeded
+from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+from database.models import Database
+from keyboards.main_menu import get_main_menu
+from keyboards.glass_buttons import get_permission_buttons
+from modules.auth import AuthManager
+from modules.downloader import DownloadManager
+from modules.uploader import UploadManager
+from modules.utils import format_size, progress_bar
 
 # تنظیمات لاگ
 logging.basicConfig(
@@ -25,510 +21,382 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class UserSession:
-    """مدیریت session هر کاربر"""
-    
-    def __init__(self, user_id: int):
-        self.user_id = user_id
-        self.client: Optional[TelegramClient] = None
-        self.phone_number: Optional[str] = None
-        self.auth_state: str = "disconnected"  # disconnected, code_sent, password_needed, connected
-        self.phone_code_hash: Optional[str] = None
-        self.last_activity: float = time.time()
-        self.is_active: bool = False
+class TelegramUserBot:
+    def __init__(self):
+        self.db = Database()
+        self.auth_manager = AuthManager(self.db)
+        self.download_manager = DownloadManager()
+        self.upload_manager = UploadManager()
+        self.user_clients = {}  # کلاینت‌های کاربران
+        self.bot = None
         
-    async def initialize(self):
-        """ایجاد session برای کاربر"""
-        session_name = f"sessions/user_{self.user_id}"
-        os.makedirs("sessions", exist_ok=True)
+    async def start_bot(self):
+        """شروع ربات"""
+        # اتصال به دیتابیس
+        await self.db.connect()
         
-        self.client = TelegramClient(
-            session_name,
-            Config.API_ID,
-            Config.API_HASH,
-            device_model="DownloadBot",
-            system_version="1.0",
-            app_version="1.0.0",
-            lang_code="fa"
+        # ایجاد ربات تلگرام
+        self.bot = Client(
+            "userbot_bot",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN
         )
         
-        await self.client.connect()
-        
-    async def send_code(self, phone_number: str):
-        """ارسال کد تأیید"""
-        if not self.client:
-            await self.initialize()
-        
-        try:
-            sent = await self.client.send_code_request(phone_number)
-            self.phone_number = phone_number
-            self.phone_code_hash = sent.phone_code_hash
-            self.auth_state = "code_sent"
-            return True
-        except FloodWaitError as e:
-            raise Exception(f"لطفا {e.seconds} ثانیه صبر کنید")
-        except Exception as e:
-            logger.error(f"Error sending code: {e}")
-            return False
-    
-    async def verify_code(self, code: str):
-        """تأیید کد ارسال شده"""
-        if not self.client or self.auth_state != "code_sent":
-            raise Exception("ابتدا شماره تلفن را ارسال کنید")
-        
-        try:
-            await self.client.sign_in(
-                phone=self.phone_number,
-                code=code,
-                phone_code_hash=self.phone_code_hash
-            )
-            self.auth_state = "connected"
-            self.is_active = True
-            return True
-        except SessionPasswordNeededError:
-            self.auth_state = "password_needed"
-            raise Exception("لطفا رمز دو مرحله‌ای را وارد کنید")
-        except PhoneCodeInvalidError:
-            raise Exception("کد وارد شده نامعتبر است")
-        except Exception as e:
-            logger.error(f"Error verifying code: {e}")
-            return False
-    
-    async def verify_password(self, password: str):
-        """تأیید رمز دو مرحله‌ای"""
-        if self.auth_state != "password_needed":
-            raise Exception("رمز دو مرحله‌ای مورد نیاز نیست")
-        
-        try:
-            await self.client.sign_in(password=password)
-            self.auth_state = "connected"
-            self.is_active = True
-            return True
-        except Exception as e:
-            logger.error(f"Error verifying password: {e}")
-            raise Exception("رمز وارد شده نامعتبر است")
-    
-    async def logout(self):
-        """خروج از حساب"""
-        if self.client:
-            await self.client.log_out()
-            await self.client.disconnect()
-            self.client = None
-        
-        # حذف فایل session
-        session_file = f"sessions/user_{self.user_id}.session"
-        if os.path.exists(session_file):
-            os.remove(session_file)
-        
-        self.auth_state = "disconnected"
-        self.is_active = False
-    
-    def update_activity(self):
-        """به‌روزرسانی زمان آخرین فعالیت"""
-        self.last_activity = time.time()
-    
-    def is_expired(self):
-        """بررسی انقضای session"""
-        return time.time() - self.last_activity > Config.SESSION_TIMEOUT
-
-class DownloadBot:
-    """ربات اصلی"""
-    
-    def __init__(self):
-        self.bot: Optional[TelegramClient] = None
-        self.user_sessions: Dict[int, UserSession] = {}
-        self.db_conn: Optional[aiosqlite.Connection] = None
-        
-    async def initialize(self):
-        """راه‌اندازی ربات"""
-        # اطمینان از وجود پوشه‌ها
-        os.makedirs("sessions", exist_ok=True)
-        os.makedirs("downloads", exist_ok=True)
-        
-        # راه‌اندازی ربات
-        self.bot = TelegramClient(
-            "bot_session",
-            Config.API_ID,
-            Config.API_HASH
-        ).start(bot_token=Config.BOT_TOKEN)
-        
-        # راه‌اندازی دیتابیس
-        await self.init_database()
-        
         # ثبت هندلرها
-        await self.register_handlers()
+        self.register_handlers()
         
-        logger.info("ربات راه‌اندازی شد")
+        # شروع ربات
+        await self.bot.start()
+        logger.info("ربات شروع به کار کرد")
         
-    async def init_database(self):
-        """راه‌اندازی دیتابیس"""
-        self.db_conn = await aiosqlite.connect(Config.DB_PATH)
-        
-        await self.db_conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                phone_number TEXT,
-                created_at TIMESTAMP,
-                last_login TIMESTAMP,
-                download_count INTEGER DEFAULT 0
-            )
-        ''')
-        await self.db_conn.commit()
+        # نگه داشتن ربات در حالت اجرا
+        await asyncio.Event().wait()
     
-    async def register_handlers(self):
+    def register_handlers(self):
         """ثبت هندلرهای ربات"""
         
-        @self.bot.on(events.NewMessage(pattern='/start'))
-        async def start_handler(event):
+        @self.bot.on_message(filters.command("start") & filters.private)
+        async def start_command(client, message: Message):
             """دستور شروع"""
-            user_id = event.sender_id
-            
-            # بررسی محدودیت کاربران
-            if Config.ALLOWED_USER_IDS and user_id not in Config.ALLOWED_USER_IDS:
-                await event.reply("❌ دسترسی شما محدود شده است.")
-                return
-            
             welcome_text = """
-🤖 **ربات دانلودر محتوای محافظت شده**
+🎊 **به ربات UserBot پیشرفته خوش آمدید!**
 
-🔹 **قابلیت‌ها:**
-• دانلود از کانال‌ها، گروه‌ها و ربات‌ها
-• پشتیبانی از محتوای فروارد شده
-• بدون نیاز به ادمین بودن
+🔒 **امنیت تضمین شده:**
+• این ربات کاملاً ایمن و متن‌باز است
+• کد ربات قابل بررسی توسط توسعه‌دهندگان
+• اطلاعات شما محفوظ می‌ماند
 
-🔹 **دستورات:**
-/login - ورود به حساب کاربری
-/download - دانلود از لینک
-/channels - لیست کانال‌ها و گروه‌ها
-/logout - خروج از حساب
-/help - راهنمایی
+📋 **قابلیت‌های اصلی:**
+1. 🔐 مدیریت چند حساب کاربری
+2. 📥 دانلود از کانال‌ها و گروه‌ها
+3. 📤 آپلود فایل‌ها
+4. ⚡ سرعت بالا با نمایش پیشرفت
+5. 👤 رفتار طبیعی و انسانی
 
-⚠️ **توجه:** این ربات به شماره تلفن شما نیاز دارد.
+⚠️ **توجه:** ربات فقط به دسترسی‌های انتخابی شما دسترسی خواهد داشت.
             """
-            await event.reply(welcome_text)
-        
-        @self.bot.on(events.NewMessage(pattern='/login'))
-        async def login_handler(event):
-            """ورود به حساب کاربری"""
-            user_id = event.sender_id
             
-            # بررسی session فعال
-            if user_id in self.user_sessions and self.user_sessions[user_id].is_active:
-                await event.reply("✅ شما قبلا وارد شده‌اید.")
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔐 ورود با حساب کاربری", callback_data="login")],
+                [InlineKeyboardButton("📖 راهنمای استفاده", callback_data="help")],
+                [InlineKeyboardButton("🔒 حریم خصوصی و امنیت", callback_data="privacy")]
+            ])
+            
+            await message.reply_text(welcome_text, reply_markup=keyboard)
+        
+        @self.bot.on_callback_query()
+        async def handle_callback(client, callback_query):
+            """مدیریت کلیک روی دکمه‌ها"""
+            data = callback_query.data
+            
+            if data == "login":
+                await self.handle_login(callback_query)
+            elif data == "help":
+                await self.show_help(callback_query)
+            elif data == "privacy":
+                await self.show_privacy_info(callback_query)
+            elif data.startswith("permission_"):
+                await self.handle_permission_selection(callback_query)
+            elif data == "confirm_login":
+                await self.complete_login(callback_query)
+            elif data == "cancel_login":
+                await callback_query.message.edit_text("❌ فرآیند ورود لغو شد.")
+            
+            await callback_query.answer()
+        
+        @self.bot.on_message(filters.command("menu") & filters.private)
+        async def show_menu(client, message: Message):
+            """نمایش منوی اصلی"""
+            user_id = message.from_user.id
+            user_data = await self.db.get_user(user_id)
+            
+            if user_data and user_data.get('session_string'):
+                await message.reply_text(
+                    "📋 **منوی اصلی**",
+                    reply_markup=get_main_menu(user_id in ADMIN_IDS)
+                )
+            else:
+                await message.reply_text("⚠️ لطفاً ابتدا وارد حساب کاربری خود شوید.")
+        
+        @self.bot.on_message(filters.command("download") & filters.private)
+        async def download_command(client, message: Message):
+            """دریافت لینک برای دانلود"""
+            args = message.text.split(" ", 1)
+            
+            if len(args) < 2:
+                await message.reply_text("""
+📥 **دانلود فایل**
+
+لطفاً لینک فایل را ارسال کنید:
+`/download [لینک]`
+
+یا می‌توانید پیام حاوی فایل را فوروارد کنید.
+                """)
                 return
             
-            # ایجاد session جدید
-            session = UserSession(user_id)
-            await session.initialize()
-            self.user_sessions[user_id] = session
-            
-            await event.reply("📱 لطفا شماره تلفن خود را با فرمت بین‌المللی ارسال کنید:\nمثال: +989123456789")
+            url = args[1]
+            await self.process_download(message, url)
         
-        @self.bot.on(events.NewMessage(pattern='/download'))
-        async def download_handler(event):
-            """دانلود محتوا"""
-            user_id = event.sender_id
-            
-            # بررسی لاگین بودن
-            if user_id not in self.user_sessions or not self.user_sessions[user_id].is_active:
-                await event.reply("❌ ابتدا با دستور /login وارد شوید.")
-                return
-            
-            session = self.user_sessions[user_id]
-            session.update_activity()
-            
-            message = event.message
-            if not message.text or len(message.text.split()) < 2:
-                await event.reply("📎 لطفا لینک پیام را ارسال کنید:\n/download https://t.me/...")
-                return
-            
-            # استخراج لینک
-            link = message.text.split()[1]
-            await self.download_content(event, session, link)
-        
-        @self.bot.on(events.NewMessage(pattern='/channels'))
-        async def channels_handler(event):
-            """لیست کانال‌ها و گروه‌ها"""
-            user_id = event.sender_id
-            
-            if user_id not in self.user_sessions or not self.user_sessions[user_id].is_active:
-                await event.reply("❌ ابتدا وارد شوید.")
-                return
-            
-            session = self.user_sessions[user_id]
-            session.update_activity()
-            
-            try:
-                await event.reply("📋 در حال دریافت لیست...")
-                
-                dialogs = []
-                async for dialog in session.client.iter_dialogs(limit=50):
-                    if dialog.is_channel or dialog.is_group:
-                        dialogs.append(
-                            f"• {dialog.name} ({'کانال' if dialog.is_channel else 'گروه'})"
-                        )
-                
-                if dialogs:
-                    response = "📊 **کانال‌ها و گروه‌های شما:**\n\n" + "\n".join(dialogs[:20])
-                    if len(dialogs) > 20:
-                        response += f"\n\n... و {len(dialogs) - 20} مورد دیگر"
-                else:
-                    response = "کانال یا گروهی یافت نشد."
-                
-                await event.reply(response)
-                
-            except Exception as e:
-                logger.error(f"Error getting channels: {e}")
-                await event.reply("❌ خطا در دریافت لیست.")
-        
-        @self.bot.on(events.NewMessage(pattern='/logout'))
-        async def logout_handler(event):
-            """خروج از حساب"""
-            user_id = event.sender_id
-            
-            if user_id in self.user_sessions:
-                await self.user_sessions[user_id].logout()
-                del self.user_sessions[user_id]
-            
-            await event.reply("✅ با موفقیت خارج شدید.")
-        
-        @self.bot.on(events.NewMessage(pattern='/help'))
-        async def help_handler(event):
-            """راهنمایی"""
-            help_text = """
-📖 **راهنمای ربات:**
-
-🔐 **احراز هویت:**
-1. /login - شروع فرآیند ورود
-2. ارسال شماره تلفن با فرمت بین‌المللی
-3. دریافت و ارسال کد تأیید
-4. در صورت نیاز: ارسال رمز دو مرحله‌ای
-
-📥 **دانلود:**
-/download [لینک] - دانلود محتوای لینک
-
-📋 **مدیریت:**
-/channels - مشاهده کانال‌ها و گروه‌ها
-/logout - خروج از حساب
-
-⚠️ **نکات مهم:**
-• شماره تلفن شما نزد ما ذخیره نمی‌شود
-• session بعد از 24 ساعت غیرفعال می‌شود
-• حداکثر حجم فایل: 2 گیگابایت
-
-🆘 **پشتیبانی:** @your_support_channel
-            """
-            await event.reply(help_text)
-        
-        @self.bot.on(events.NewMessage())
-        async def message_handler(event):
-            """مدیریت پیام‌های معمولی"""
-            user_id = event.sender_id
-            message = event.message
-            
-            if user_id not in self.user_sessions:
-                return
-            
-            session = self.user_sessions[user_id]
-            session.update_activity()
-            
-            # مدیریت کد تأیید
-            if session.auth_state == "code_sent":
-                if message.text and message.text.isdigit():
-                    try:
-                        await session.verify_code(message.text)
-                        await event.reply("✅ ورود موفقیت‌آمیز بود!")
-                        
-                        # ذخیره در دیتابیس
-                        await self.save_user_info(user_id, session.phone_number)
-                        
-                    except Exception as e:
-                        await event.reply(f"❌ {str(e)}")
-                else:
-                    await event.reply("❌ لطفا فقط عدد کد تأیید را ارسال کنید.")
-            
-            # مدیریت رمز دو مرحله‌ای
-            elif session.auth_state == "password_needed":
-                try:
-                    await session.verify_password(message.text)
-                    await event.reply("✅ ورود موفقیت‌آمیز بود!")
-                    
-                    # ذخیره در دیتابیس
-                    await self.save_user_info(user_id, session.phone_number)
-                    
-                except Exception as e:
-                    await event.reply(f"❌ {str(e)}")
-            
-            # مدیریت شماره تلفن
-            elif session.auth_state == "disconnected":
-                if message.text and re.match(r'^\+\d{10,15}$', message.text):
-                    try:
-                        success = await session.send_code(message.text)
-                        if success:
-                            await event.reply("📲 کد تأیید به شماره شما ارسال شد.\nلطفا کد را ارسال کنید.")
-                        else:
-                            await event.reply("❌ خطا در ارسال کد.")
-                    except Exception as e:
-                        await event.reply(f"❌ {str(e)}")
-                else:
-                    await event.reply("❌ فرمت شماره تلفن نامعتبر است.\nمثال: +989123456789")
+        @self.bot.on_message(filters.private & filters.forwarded)
+        async def handle_forwarded_message(client, message: Message):
+            """مدیریت پیام‌های فوروارد شده"""
+            await self.process_download(message)
     
-    async def save_user_info(self, user_id: int, phone_number: str):
-        """ذخیره اطلاعات کاربر در دیتابیس"""
-        try:
-            await self.db_conn.execute('''
-                INSERT OR REPLACE INTO users 
-                (user_id, phone_number, created_at, last_login, download_count)
-                VALUES (?, ?, ?, ?, COALESCE((SELECT download_count FROM users WHERE user_id = ?), 0))
-            ''', (user_id, phone_number, datetime.now(), datetime.now(), user_id))
-            await self.db_conn.commit()
-        except Exception as e:
-            logger.error(f"Error saving user info: {e}")
+    async def handle_login(self, callback_query):
+        """مدیریت فرآیند ورود"""
+        # نمایش توضیحات دسترسی‌ها
+        permissions_text = """
+🔐 **درخواست دسترسی‌های لازم:**
+
+ربات برای ارائه خدمات به دسترسی‌های زیر نیاز دارد:
+
+✅ **دسترسی‌های پایه:**
+• خواندن پیام‌ها (برای دانلود محتوا)
+• مشاهده گروه‌ها و کانال‌ها
+
+✅ **دسترسی‌های اختیاری (انتخاب شما):**
+• ارسال پیام
+• مدیریت چت
+• حذف پیام‌ها
+
+⚠️ **تضمین امنیت:**
+• هیچ اطلاعاتی ذخیره نمی‌شود
+• کد منبع قابل بررسی است
+• امکان خروج در هر لحظه
+
+لطفاً دسترسی‌های مورد نظر خود را انتخاب کنید:
+        """
+        
+        await callback_query.message.edit_text(
+            permissions_text,
+            reply_markup=get_permission_buttons()
+        )
     
-    async def download_content(self, event, session: UserSession, link: str):
-        """دانلود محتوای لینک"""
+    async def handle_permission_selection(self, callback_query):
+        """مدیریت انتخاب دسترسی‌ها"""
+        permission_type = callback_query.data.split("_")[1]
+        user_id = callback_query.from_user.id
+        
+        # ذخیره انتخاب کاربر
+        await self.db.save_user_permission(user_id, permission_type)
+        
+        # درخواست شماره تلفن
+        await callback_query.message.edit_text(
+            "📱 لطفاً شماره تلفن خود را با فرمت بین‌المللی ارسال کنید:\n\n"
+            "مثال: `+989123456789`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="login")],
+                [InlineKeyboardButton("❌ لغو", callback_data="cancel_login")]
+            ])
+        )
+        
+        # تنظیم حالت برای دریافت شماره تلفن
+        await self.db.set_user_state(user_id, "awaiting_phone")
+    
+    async def complete_login(self, callback_query):
+        """تکمیل فرآیند ورود"""
+        user_id = callback_query.from_user.id
+        user_data = await self.db.get_user(user_id)
+        
+        if not user_data or 'phone_number' not in user_data:
+            await callback_query.message.edit_text("❌ اطلاعات ناقص است. لطفاً مجدداً تلاش کنید.")
+            return
+        
         try:
-            # استخراج اطلاعات از لینک
-            if "t.me/" not in link:
-                await event.reply("❌ لینک نامعتبر است.")
-                return
-            
-            # نمایش وضعیت
-            status_msg = await event.reply("⏳ در حال بررسی لینک...")
-            
-            # دریافت پیام از لینک
-            try:
-                message = await session.client.get_messages(link)
-            except ValueError:
-                # اگر لینک مستقیم نبود، سعی در تجزیه
-                parts = link.split('/')
-                if len(parts) >= 2:
-                    entity = parts[-2]
-                    message_id = int(parts[-1])
-                    message = await session.client.get_messages(entity, ids=message_id)
-                else:
-                    raise
-            
-            if not message or not message.media:
-                await status_msg.edit("❌ محتوای مدیا یافت نشد.")
-                return
-            
-            await status_msg.edit("📥 در حال دانلود...")
-            
-            # دانلود فایل
-            file_name = f"downloads/{user_id}_{int(time.time())}"
-            file_path = await session.client.download_media(
-                message,
-                file=file_name,
-                progress_callback=lambda d, t: self.progress_callback(d, t, status_msg)
+            # ایجاد کلاینت برای کاربر
+            session_name = f"user_{user_id}"
+            client = Client(
+                session_name,
+                api_id=API_ID,
+                api_hash=API_HASH,
+                device_model="UserBot",
+                system_version="1.0",
+                app_version="1.0.0"
             )
             
-            if not file_path:
-                await status_msg.edit("❌ خطا در دانلود.")
-                return
+            await client.connect()
             
-            await status_msg.edit("📤 در حال آپلود...")
+            # ارسال کد تأیید
+            sent_code = await client.send_code(user_data['phone_number'])
             
-            # ارسال فایل به کاربر
-            async with aiofiles.open(file_path, 'rb') as f:
-                await self.bot.send_file(
-                    event.chat_id,
-                    file_path,
-                    caption=f"✅ دانلود شد\n📁 {os.path.basename(file_path)}",
-                    progress_callback=lambda d, t: self.progress_callback(d, t, status_msg, "آپلود")
+            # درخواست کد تأیید از کاربر
+            await callback_query.message.edit_text(
+                "🔢 لطفاً کد تأیید ارسال شده به تلگرام را وارد کنید:\n\n"
+                "کد را به این فرمت ارسال کنید: `12345`",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="cancel_login")]
+                ])
+            )
+            
+            # ذخیره اطلاعات برای مرحله بعد
+            await self.db.set_user_state(user_id, "awaiting_code")
+            await self.db.save_temp_data(user_id, {
+                'client': client,
+                'phone_code_hash': sent_code.phone_code_hash
+            })
+            
+        except Exception as e:
+            logger.error(f"خطا در ورود: {e}")
+            await callback_query.message.edit_text("❌ خطا در فرآیند ورود. لطفاً مجدداً تلاش کنید.")
+    
+    async def process_download(self, message: Message, url=None):
+        """پردازش درخواست دانلود"""
+        user_id = message.from_user.id
+        user_data = await self.db.get_user(user_id)
+        
+        if not user_data or 'session_string' not in user_data:
+            await message.reply_text("⚠️ لطفاً ابتدا وارد حساب کاربری خود شوید.")
+            return
+        
+        try:
+            # ایجاد کلاینت کاربر
+            client = self.user_clients.get(user_id)
+            if not client:
+                client = await self.auth_manager.create_client_from_session(
+                    user_data['session_string']
+                )
+                self.user_clients[user_id] = client
+            
+            # شروع دانلود
+            progress_msg = await message.reply_text("📥 در حال شروع دانلود...")
+            
+            if url:
+                # دانلود از لینک
+                result = await self.download_manager.download_from_url(
+                    client, url, user_id, progress_callback=lambda p: self.update_progress(p, progress_msg)
+                )
+            else:
+                # دانلود از پیام فوروارد شده
+                result = await self.download_manager.download_message(
+                    client, message, user_id, progress_callback=lambda p: self.update_progress(p, progress_msg)
                 )
             
-            await status_msg.delete()
+            if result['success']:
+                # آپلود فایل
+                await progress_msg.edit_text("📤 در حال آپلود فایل...")
+                
+                upload_result = await self.upload_manager.upload_file(
+                    result['file_path'], 
+                    message.chat.id,
+                    progress_callback=lambda p: self.update_progress(p, progress_msg)
+                )
+                
+                if upload_result['success']:
+                    await progress_msg.edit_text("✅ فایل با موفقیت آپلود شد!")
+                else:
+                    await progress_msg.edit_text(f"❌ خطا در آپلود: {upload_result['error']}")
             
-            # به‌روزرسانی تعداد دانلودها
-            await self.update_download_count(event.sender_id)
-            
-            # حذف فایل موقت
-            try:
-                os.remove(file_path)
-            except:
-                pass
-            
-        except FloodWaitError as e:
-            await event.reply(f"⏳ لطفا {e.seconds} ثانیه صبر کنید و دوباره تلاش کنید.")
         except Exception as e:
-            logger.error(f"Download error: {e}")
-            await event.reply(f"❌ خطا: {str(e)}")
+            logger.error(f"خطا در دانلود: {e}")
+            await message.reply_text(f"❌ خطا در پردازش: {str(e)}")
     
-    async def progress_callback(self, downloaded, total, message, action="دانلود"):
-        """نمایش پیشرفت"""
+    async def update_progress(self, progress_data, progress_msg):
+        """به‌روزرسانی وضعیت پیشرفت"""
         try:
-            percent = (downloaded / total) * 100
-            bar_length = 20
-            filled_length = int(bar_length * downloaded // total)
-            bar = '▓' * filled_length + '░' * (bar_length - filled_length)
-            
-            text = f"{action}: {percent:.1f}%\n{bar}\n{self.format_size(downloaded)} / {self.format_size(total)}"
-            
-            await message.edit(text)
+            bar = progress_bar(progress_data['percentage'], 20)
+            text = f"""
+📊 **پیشرفت دانلود**
+
+{bar} {progress_data['percentage']:.1f}%
+
+📁 فایل: `{progress_data.get('filename', 'در حال پردازش')}`
+📊 حجم: {format_size(progress_data.get('downloaded', 0))} / {format_size(progress_data.get('total', 0))}
+⚡ سرعت: {format_size(progress_data.get('speed', 0))}/s
+⏱️ زمان باقی‌مانده: {progress_data.get('eta', '--')} ثانیه
+            """
+            await progress_msg.edit_text(text)
         except:
             pass
     
-    def format_size(self, size_bytes):
-        """فرمت‌بندی اندازه فایل"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.1f} TB"
-    
-    async def update_download_count(self, user_id: int):
-        """به‌روزرسانی تعداد دانلودها"""
-        try:
-            await self.db_conn.execute(
-                "UPDATE users SET download_count = download_count + 1 WHERE user_id = ?",
-                (user_id,)
-            )
-            await self.db_conn.commit()
-        except Exception as e:
-            logger.error(f"Error updating download count: {e}")
-    
-    async def cleanup_sessions(self):
-        """پاک‌سازی session های منقضی شده"""
-        while True:
-            await asyncio.sleep(3600)  # هر ساعت یکبار
-            
-            expired_users = []
-            for user_id, session in self.user_sessions.items():
-                if session.is_expired():
-                    expired_users.append(user_id)
-            
-            for user_id in expired_users:
-                await self.user_sessions[user_id].logout()
-                del self.user_sessions[user_id]
-                logger.info(f"Session expired for user {user_id}")
-    
-    async def run(self):
-        """اجرای ربات"""
-        await self.initialize()
+    async def show_help(self, callback_query):
+        """نمایش راهنما"""
+        help_text = """
+📖 **راهنمای استفاده از ربات**
+
+🔹 **1. ورود به حساب:**
+   - روی دکمه "ورود با حساب کاربری" کلیک کنید
+   - دسترسی‌های مورد نظر را انتخاب کنید
+   - شماره تلفن و کد تأیید را وارد کنید
+
+🔹 **2. دانلود فایل:**
+   - ارسال لینک با دستور `/download [لینک]`
+   - فوروارد پیام حاوی فایل
+   - انتخاب از منوی دانلود
+
+🔹 **3. مدیریت حساب:**
+   - مشاهده حساب‌های متصل
+   - خروج از حساب‌ها
+   - تنظیمات دانلود/آپلود
+
+🔹 **4. تنظیمات:**
+   - محدودیت سرعت
+   - فرمت خروجی
+   - کیفیت دانلود
+
+🔹 **5. پنل ادمین** (فقط برای مدیران):
+   - مشاهده کاربران
+   - آمار استفاده
+   - تنظیمات سیستم
+
+⚠️ **نکات امنیتی:**
+- هرگز اطلاعات حساب خود را با دیگران به اشتراک نگذارید
+- به صورت دوره‌ای رمز عبور خود را تغییر دهید
+- فقط از کانال‌های معتبر دانلود کنید
+
+برای شروع از دستور /start استفاده کنید.
+        """
         
-        # شروع پاک‌سازی خودکار
-        asyncio.create_task(self.cleanup_sessions())
+        await callback_query.message.edit_text(
+            help_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="start")]
+            ])
+        )
+    
+    async def show_privacy_info(self, callback_query):
+        """نمایش اطلاعات حریم خصوصی"""
+        privacy_text = """
+🔒 **حریم خصوصی و امنیت**
+
+✅ **اطلاعات ذخیره شده:**
+• شناسه کاربری
+• رشته نشست (Session String) رمزنگاری شده
+• تنظیمات کاربر
+
+❌ **اطلاعات ذخیره نشده:**
+• شماره تلفن
+• رمز عبور
+• پیام‌های شخصی
+• اطلاعات تماس
+
+🔐 **رمزنگاری:**
+• همه داده‌ها با AES-256 رمزنگاری می‌شوند
+• ارتباطات با سرورهای تلگرام رمزنگاری شده هستند
+• نشست‌ها به صورت محلی ذخیره می‌شوند
+
+🛡️ **امنیت:**
+• کد منبع باز و قابل بررسی
+• هیچ دسترسی غیرضروری
+• امکان حذف کامل داده‌ها
+
+📜 **متن کامل سیاست حریم خصوصی در مخزن گیت‌هاب موجود است.**
+
+🔄 **برای حذف کامل داده‌های خود از دستور /delete_account استفاده کنید.**
+        """
         
-        logger.info("ربات در حال اجراست...")
-        await self.bot.run_until_disconnected()
+        await callback_query.message.edit_text(
+            privacy_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="start")],
+                [InlineKeyboardButton("🗑️ حذف حساب", callback_data="request_delete")]
+            ])
+        )
 
 async def main():
-    """تابع اصلی"""
-    bot = DownloadBot()
-    await bot.run()
+    """تابع اصلی اجرای ربات"""
+    bot = TelegramUserBot()
+    await bot.start_bot()
 
 if __name__ == "__main__":
-    # بررسی تنظیمات
-    if not Config.API_ID or not Config.API_HASH or not Config.BOT_TOKEN:
-        print("❌ لطفا تنظیمات را در فایل .env پر کنید.")
-        print("API_ID و API_HASH را از my.telegram.org دریافت کنید.")
-        print("BOT_TOKEN را از @BotFather دریافت کنید.")
-        exit(1)
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n❌ ربات متوقف شد.")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+    asyncio.run(main())
