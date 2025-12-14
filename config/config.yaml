@@ -1,0 +1,25 @@
+# config/config.yaml
+bot:
+  name: "Telegram UserBot"
+  version: "2.0.0"
+  developer: "Your Name"
+  support: "@your_support"
+
+limits:
+  daily_downloads: 100
+  daily_uploads: 50
+  max_file_size_mb: 2048
+  max_sessions_per_user: 5
+
+features:
+  multi_account: true
+  human_behavior: true
+  admin_panel: true
+  auto_upload: true
+  resume_download: true
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  max_size_mb: 100
+  backup_count: 5
