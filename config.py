@@ -1,23 +1,24 @@
+# config/settings.py
 import os
+from pathlib import Path
+from typing import Dict, List, Any
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# اطلاعات API تلگرام
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
-# ادمین‌های ربات
-ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "").split(",") if id]
-
-# تنظیمات دیتابیس
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///database.db")
-
-# محدودیت‌ها
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-MAX_CONCURRENT_DOWNLOADS = 3
-DOWNLOAD_SPEED_LIMIT = 50 * 1024 * 1024  # 50 MB/s
-
-# تنظیمات سرور (اختیاری)
-PROXY = None  # یا {'scheme': 'socks5', 'hostname': 'localhost', 'port': 9050}
+class Settings:
+    """کلاس مدیریت تنظیمات"""
+    
+    def __init__(self):
+        # مسیرهای اصلی
+        self.BASE_DIR = Path(__file__).parent.parent
+        self.DATA_DIR = self.BASE_DIR / "data"
+        self.DOWNLOADS_DIR = self.BASE_DIR / "downloads"
+        self.LOGS_DIR = self.BASE_DIR / "logs"
+        self.SESSIONS_DIR = self.BASE_DIR / "data" / "sessions"
+        
+        # اطلاعات API
+        self.API_ID = int(os.getenv("API_ID", 0))
+        self.API_HASH = os.getenv("API_HASH", "")
+       
