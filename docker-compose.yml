@@ -1,3 +1,4 @@
+# docker-compose.yml
 version: '3.8'
 
 services:
@@ -7,13 +8,28 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/app/data
+      - ./downloads:/app/downloads
       - ./logs:/app/logs
       - ./sessions:/app/sessions
+      - ./backups:/app/backups
     environment:
       - API_ID=${API_ID}
       - API_HASH=${API_HASH}
       - BOT_TOKEN=${BOT_TOKEN}
       - ADMIN_IDS=${ADMIN_IDS}
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+    networks:
+      - bot-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-userbot
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis-data:/data
     networks:
       - bot-network
 
